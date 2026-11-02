@@ -178,6 +178,13 @@ sudo journalctl -u tgdrive.service --since "10 minutes ago"
 
 ## 常见问题
 
+### 与音乐播放器共用后端
+
+`/v1/music/*` 提供独立的只读音频接口。在 `.env` 中配置 `MUSIC_SERVICE_TOKEN`（单独的随机令牌）和 `MUSIC_FRONTEND_ORIGIN`（音乐网页的HTTPS origin）后重启。
+
+音乐Worker将后端基址设置为 `TGDRIVE_URL`，将同一专用令牌设置为 `TGDRIVE_TOKEN`。音频浏览在分页前过滤视频，播放链接使用独立签名且会再次检查媒体类型；该令牌不能操作TG账号或网盘设置。
+
+
 | 现象 | 检查 |
 | --- | --- |
 | 网页提示后端不可连接 | 后端健康接口、有效 HTTPS 证书、Nginx 前缀、`BACKEND_URL` |

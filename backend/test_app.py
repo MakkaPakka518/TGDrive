@@ -232,6 +232,47 @@ class PhoneLoginTests(BackendCase):
 
 
 class MultiSourceTests(BackendCase):
+    async def test_music_catalog_filters_audio_before_pagination(self):
+        source_id = self.add_source()
+        items = [{"id": number, "kind": "audio" if number % 2 else "video", "mime": "audio/WAV" if number % 2 else "video/mp4", "title": "item", "date": "2026-01-01"} for number in range(1, 101)]
+        self.store.index_batch(source_id, items)
+        with patch.object(app, "MUSIC_SERVICE_TOKEN", "audio-scope"):
+            response = await app.music_catalog(page=2, authorization="Bearer audio-scope")
+            self.assertEqual(response["total"], 50)
+            self.assertEqual(len(response["items"]), 20)
+            self.assertTrue(all(item["kind"] == "audio" and "account_id" not in item for item in response["items"]))
+            sources = await app.music_sources(authorization="audio-scope")
+            self.assertEqual(sources["sources"][0]["audio_count"], 50)
+            self.assertNotIn("account_id", sources["sources"][0])
+            with self.assertRaises(app.HTTPException):
+                app.require_auth("audio-scope")
+            with self.assertRaises(app.HTTPException):
+                await app.music_catalog(authorization="test")
+
+    async def test_music_stream_rejects_video_and_other_signatures(self):
+        source_id = self.add_source()
+        message = SimpleNamespace(id=1, document=SimpleNamespace(mime_type="video/mp4", size=10, attributes=[]), message="", date=None)
+        request = Request({"type": "http", "method": "HEAD", "headers": []})
+        with patch.object(app, "get_message", AsyncMock(return_value=(object(), message))):
+            expires, signature = app.sign_media(source_id, 1, "music")
+            with self.assertRaises(app.HTTPException) as rejected:
+                await app.music_media(source_id, 1, request, expires, signature)
+            self.assertEqual(rejected.exception.status_code, 415)
+            message.document.mime_type = "audio/WAV"
+            response = await app.music_media(source_id, 1, request, expires, signature)
+            self.assertEqual(response.headers["content-type"], "audio/wav")
+            other_exp, other_sig = app.sign_media(source_id, 1)
+            with self.assertRaises(app.HTTPException) as invalid:
+                await app.music_media(source_id, 1, request, other_exp, other_sig)
+            self.assertEqual(invalid.exception.status_code, 403)
+
+    async def test_music_cors_only_allows_configured_origins(self):
+        with patch.object(app, "MUSIC_FRONTEND_ORIGIN", "https://music.example.test"):
+            for origin, allowed in [("https://music.example.test", True), ("https://drive.example.test", True), ("https://other.example.test", False)]:
+                request = Request({"type": "http", "method": "GET", "headers": [(b"origin", origin.encode())]})
+                response = await app.secure_headers(request, AsyncMock(return_value=app.Response()))
+                self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), origin if allowed else None)
+
     def test_legacy_migration_is_idempotent(self):
         encrypted = app.FERNET.encrypt(b"legacy-test-session")
         self.store.import_legacy(encrypted, {"channel_id": -100123, "title": "Legacy source"})

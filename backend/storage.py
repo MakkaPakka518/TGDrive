@@ -147,8 +147,10 @@ class Store:
         with self.db:
             self.db.execute("DELETE FROM media WHERE source_id=? AND message_id=?", (source_id, message_id))
 
-    def catalog(self, page=1, source_id="", query=""):
+    def catalog(self, page=1, source_id="", query="", audio_only=False):
         where, params = [], []
+        if audio_only:
+            where.append("json_extract(m.info,'$.kind')='audio' AND lower(json_extract(m.info,'$.mime')) LIKE 'audio/%'")
         if source_id:
             where.append("m.source_id=?")
             params.append(source_id)
@@ -164,3 +166,9 @@ class Store:
             " ORDER BY m.date DESC,m.source_id,m.message_id DESC LIMIT ? OFFSET ?", params + [PAGE_SIZE, (page - 1) * PAGE_SIZE])
         items = [{**json.loads(row["info"]), "source_id": row["source_id"], "source_title": row["source_title"], "account_id": row["account_id"]} for row in rows]
         return {"items": items, "total": total, "page": page, "page_size": PAGE_SIZE, "pages": pages, "has_next": page < pages}
+
+    def audio_sources(self):
+        return [dict(row) for row in self.db.execute("""SELECT s.id,s.title,s.kind,s.history_done,s.error,
+            COUNT(m.message_id) AS audio_count FROM sources s LEFT JOIN media m ON m.source_id=s.id
+            AND json_extract(m.info,'$.kind')='audio' AND lower(json_extract(m.info,'$.mime')) LIKE 'audio/%'
+            GROUP BY s.id HAVING audio_count>0 ORDER BY s.title""")]

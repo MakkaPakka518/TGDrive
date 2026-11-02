@@ -41,10 +41,12 @@ from storage import PAGE_SIZE, Store
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SERVICE_TOKEN = os.environ["SERVICE_TOKEN"]
+MUSIC_SERVICE_TOKEN = os.environ.get("MUSIC_SERVICE_TOKEN", "")
 MEDIA_SECRET = os.environ["MEDIA_SECRET"].encode()
 FERNET = Fernet(os.environ["SESSION_ENCRYPTION_KEY"].encode())
 PUBLIC_BASE = os.environ["PUBLIC_BASE"].rstrip("/")
 FRONTEND_ORIGIN = os.environ["FRONTEND_ORIGIN"].rstrip("/")
+MUSIC_FRONTEND_ORIGIN = os.environ.get("MUSIC_FRONTEND_ORIGIN", "").rstrip("/")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 SESSION_FILE = DATA_DIR / "telegram.session.enc"
 CONFIG_FILE = DATA_DIR / "config.json"
@@ -97,6 +99,20 @@ def require_auth(authorization):
         supplied = supplied[7:].strip()
     if not supplied or not hmac.compare_digest(supplied, SERVICE_TOKEN):
         raise HTTPException(401, "unauthorized")
+
+
+def require_music_auth(authorization):
+    value = str(authorization or "").strip()
+    if value.lower().startswith("bearer "):
+        value = value[7:].strip()
+    if not MUSIC_SERVICE_TOKEN or not hmac.compare_digest(value, MUSIC_SERVICE_TOKEN):
+        raise HTTPException(401, "unauthorized")
+
+
+def require_audio(info):
+    if not info or info["kind"] != "audio" or not info["mime"].lower().startswith("audio/"):
+        raise HTTPException(415, "audio_only")
+    return info
 
 
 def load_config():
@@ -364,10 +380,22 @@ async def get_message(source_id, message_id):
 
 @app.middleware("http")
 async def secure_headers(request: Request, call_next):
+    origin = request.headers.get("origin", "") if request else ""
+    allowed = {value for value in [FRONTEND_ORIGIN, MUSIC_FRONTEND_ORIGIN] if value}
+    if request and request.method == "OPTIONS" and origin in allowed:
+        return Response(status_code=204, headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range",
+            "Access-Control-Max-Age": "600", "Vary": "Origin",
+        })
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Cache-Control"] = "no-store"
-    response.headers["Access-Control-Allow-Origin"] = FRONTEND_ORIGIN
+    if origin in allowed or not origin:
+        response.headers["Access-Control-Allow-Origin"] = origin or FRONTEND_ORIGIN
+        response.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
+    response.headers["Vary"] = "Origin"
     return response
 
 
@@ -800,6 +828,54 @@ async def download_link(source_id: str, message_id: int, authorization: str = He
     return {"download_url": f"{PUBLIC_BASE}/v1/download/{source_id}/{message_id}?exp={expires}&sig={signature}", "file_name": info["file_name"]}
 
 
+# Read-only, audio-only integration for a separate music frontend.
+@app.get("/v1/music/sources")
+async def music_sources(authorization: str = Header(None)):
+    require_music_auth(authorization)
+    return {"sources": store.audio_sources()}
+
+
+@app.get("/v1/music/catalog")
+async def music_catalog(page: int = 1, source_id: str = "", q: str = "", authorization: str = Header(None)):
+    require_music_auth(authorization)
+    result = store.catalog(page=max(1, page), source_id=source_id, query=q[:200], audio_only=True)
+    for item in result["items"]:
+        item.pop("account_id", None)
+    return result
+
+
+@app.get("/v1/music/item/{source_id}/{message_id}")
+async def music_item(source_id: str, message_id: int, authorization: str = Header(None)):
+    require_music_auth(authorization)
+    _, message = await get_message(source_id, message_id)
+    info = require_audio(document_info(message))
+    info.update(source_id=source_id, has_artwork=bool(getattr(message.document, "thumbs", None)))
+    for attribute in message.document.attributes:
+        if isinstance(attribute, DocumentAttributeAudio) and attribute.title:
+            info["title"] = attribute.title[:200]
+    expires, signature = sign_media(source_id, message_id, "music")
+    info["stream_url"] = f"{PUBLIC_BASE}/v1/music/media/{source_id}/{message_id}?exp={expires}&sig={signature}"
+    if info["has_artwork"]:
+        expires, signature = sign_media(source_id, message_id, "music_thumb")
+        info["thumb_url"] = f"{PUBLIC_BASE}/v1/music/thumb/{source_id}/{message_id}?exp={expires}&sig={signature}"
+    return info
+
+
+@app.api_route("/v1/music/media/{source_id}/{message_id}", methods=["GET", "HEAD"])
+async def music_media(source_id: str, message_id: int, request: Request, exp: int, sig: str):
+    return await serve_media(source_id, message_id, request, exp, sig, music=True)
+
+
+@app.get("/v1/music/thumb/{source_id}/{message_id}")
+async def music_thumb(source_id: str, message_id: int, exp: int, sig: str):
+    if not verify_media(source_id, message_id, exp, sig, "music_thumb"):
+        raise HTTPException(403, "invalid_signature")
+    _, message = await get_message(source_id, message_id)
+    require_audio(document_info(message))
+    thumb_exp, thumb_sig = sign_media(source_id, message_id, "thumb")
+    return await thumb(source_id, message_id, thumb_exp, thumb_sig)
+
+
 def range_bounds(value, size):
     if size <= 0:
         raise HTTPException(416, "range_not_satisfiable", headers={"Content-Range": f"bytes */{size}"})
@@ -831,11 +907,13 @@ async def download(source_id: str, message_id: int, request: Request, exp: int, 
     return await serve_media(source_id, message_id, request, exp, sig, attachment=True)
 
 
-async def serve_media(source_id, message_id, request, exp, sig, attachment=False):
-    if not verify_media(source_id, message_id, exp, sig, "download" if attachment else "media"):
+async def serve_media(source_id, message_id, request, exp, sig, attachment=False, music=False):
+    if not verify_media(source_id, message_id, exp, sig, "music" if music else "download" if attachment else "media"):
         raise HTTPException(403, "invalid_signature")
     client, message = await get_message(source_id, message_id)
     info = document_info(message)
+    if music:
+        require_audio(info)
     if not info:
         raise HTTPException(404, "media_not_found")
     size = info["size"]
@@ -850,6 +928,9 @@ async def serve_media(source_id, message_id, request, exp, sig, attachment=False
     if partial:
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
     media_type = "application/octet-stream" if attachment else info["mime"]
+    if music:
+        aliases = {"audio/m4a": "audio/mp4", "audio/x-flac": "audio/flac", "audio/vnd.wave": "audio/wav", "audio/x-wav": "audio/wav"}
+        media_type = aliases.get(media_type.lower(), media_type.lower())
     if request.method == "HEAD":
         return Response(status_code=206 if partial else 200, media_type=media_type, headers=headers)
 
