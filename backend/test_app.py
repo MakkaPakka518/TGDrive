@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
 
@@ -18,9 +19,30 @@ from starlette.requests import Request
 from telethon.tl.types import DocumentAttributeFilename
 from telethon.tl.types.auth import SentCode, SentCodeTypeApp
 from telethon.errors import FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError
+from storage import Store
 
 
-class DriveTests(unittest.IsolatedAsyncioTestCase):
+class BackendCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = Store(__import__("pathlib").Path(self.directory.name) / "test.db")
+        self.addCleanup(self.store.close)
+        for name, value in [("store", self.store), ("clients", {}), ("client_locks", {}), ("source_jobs", {}), ("account_jobs", {}), ("dialog_cache", {}), ("dialog_locks", {}), ("thumb_cache", {}), ("index_slots", asyncio.Semaphore(3))]:
+            patcher = patch.object(app, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def add_account(self, account_id="a" * 24, user_id="1"):
+        self.store.save_account(account_id, {"id": user_id, "name": "Test account"}, app.FERNET.encrypt(b"test-session"))
+        return account_id
+
+    def add_source(self, account_id=None, chat_id=-123):
+        account_id = account_id or self.add_account()
+        return self.store.add_source(account_id, chat_id, "Test group", "", "group", {"type": "chat", "id": abs(chat_id)})
+
+
+class DriveTests(BackendCase):
     async def test_cors_uses_configured_frontend(self):
         response = await app.secure_headers(None, AsyncMock(return_value=app.Response()))
         self.assertEqual(response.headers["Access-Control-Allow-Origin"], "https://drive.example.test")
@@ -34,15 +56,17 @@ class DriveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.exception.status_code, 416)
             self.assertEqual(result.exception.headers["Content-Range"], "bytes */100")
 
-    def test_signatures_bind_channel(self):
-        with patch.object(app, "selected_channel_id", return_value=-1001):
-            expires, signature = app.sign_media(42)
-            self.assertTrue(app.verify_media(42, expires, signature))
-            self.assertFalse(app.verify_media(43, expires, signature))
-            self.assertFalse(app.verify_media(42, expires, signature, "thumb"))
-            self.assertFalse(app.verify_media(42, int(time.time()) - 1, signature))
-        with patch.object(app, "selected_channel_id", return_value=-1002):
-            self.assertFalse(app.verify_media(42, expires, signature))
+    def test_signatures_bind_account_and_source(self):
+        first = self.add_source()
+        second = self.add_source(self.add_account("b" * 24, "2"))
+        expires, signature = app.sign_media(first, 42)
+        self.assertTrue(app.verify_media(first, 42, expires, signature))
+        self.assertFalse(app.verify_media(second, 42, expires, signature))
+        self.assertFalse(app.verify_media(first, 43, expires, signature))
+        self.assertFalse(app.verify_media(first, 42, expires, signature, "thumb"))
+        self.assertFalse(app.verify_media(first, 42, int(time.time()) - 1, signature))
+        self.store.remove_source(first)
+        self.assertFalse(app.verify_media(first, 42, expires, signature))
 
     async def test_media_bytes_head_and_unicode_filename(self):
         payload = bytes(range(256)) * 4000
@@ -55,11 +79,12 @@ class DriveTests(unittest.IsolatedAsyncioTestCase):
                 yield payload[start:start + request_size]
 
         client = SimpleNamespace(iter_download=download)
-        with patch.object(app, "get_message", AsyncMock(return_value=(client, message))), patch.object(app, "selected_channel_id", return_value=-1001):
-            exp, sig = app.sign_media(42)
+        source_id = self.add_source()
+        with patch.object(app, "get_message", AsyncMock(return_value=(client, message))):
+            exp, sig = app.sign_media(source_id, 42)
             for method, range_value, expected in [("GET", "bytes=123-700123", payload[123:700124]), ("GET", "bytes=-10", payload[-10:]), ("GET", "bytes=0-0", payload[:1]), ("HEAD", "bytes=10-19", b"")]:
                 request = Request({"type": "http", "method": method, "headers": [(b"range", range_value.encode())]})
-                response = await app.media(42, request, exp, sig)
+                response = await app.media(source_id, 42, request, exp, sig)
                 self.assertEqual(response.status_code, 206)
                 self.assertIn("filename*=UTF-8''", response.headers["content-disposition"])
                 self.assertNotIn("\r", response.headers["content-disposition"])
@@ -71,7 +96,7 @@ class DriveTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_login_cleanup_keeps_active_client(self):
         client = SimpleNamespace(disconnect=AsyncMock())
         pending = SimpleNamespace(disconnect=AsyncMock())
-        with patch.object(app, "main_client", client), patch.object(app, "login_sessions", {
+        with patch.object(app, "clients", {"active": client}), patch.object(app, "login_sessions", {
             "completed": {"client": client, "expires": 0},
             "expired": {"client": pending, "expires": 0},
         }):
@@ -81,16 +106,41 @@ class DriveTests(unittest.IsolatedAsyncioTestCase):
             pending.disconnect.assert_awaited_once()
             self.assertFalse(app.login_sessions)
 
+    async def test_download_attachment_range_and_separate_signature(self):
+        source_id = self.add_source()
+        payload = b"0123456789" * 100
+        message = SimpleNamespace(id=42, document=SimpleNamespace(mime_type="video/mp4", size=len(payload), attributes=[DocumentAttributeFilename("测试视频.mp4")]), media=object(), message="", date=datetime.now(timezone.utc))
 
-class PhoneLoginTests(unittest.IsolatedAsyncioTestCase):
+        async def chunks(media, offset, request_size):
+            yield payload[offset:]
+
+        client = SimpleNamespace(iter_download=chunks)
+        request = Request({"type": "http", "method": "GET", "headers": [(b"range", b"bytes=100-199")]})
+        with patch.object(app, "get_message", AsyncMock(return_value=(client, message))):
+            media_exp, media_sig = app.sign_media(source_id, 42)
+            with self.assertRaises(app.HTTPException) as forbidden:
+                await app.download(source_id, 42, request, media_exp, media_sig)
+            self.assertEqual(forbidden.exception.status_code, 403)
+            link = await app.download_link(source_id, 42, authorization="test")
+            params = parse_qs(urlparse(link["download_url"]).query)
+            response = await app.download(source_id, 42, request, int(params["exp"][0]), params["sig"][0])
+            self.assertEqual(response.status_code, 206)
+            self.assertEqual(response.headers["content-type"], "application/octet-stream")
+            self.assertTrue(response.headers["content-disposition"].startswith("attachment; filename*=UTF-8''"))
+            self.assertEqual(response.headers["content-range"], "bytes 100-199/1000")
+            self.assertEqual(b"".join([chunk async for chunk in response.body_iterator]), payload[100:200])
+
+
+class PhoneLoginTests(BackendCase):
     async def asyncSetUp(self):
+        await super().asyncSetUp()
         self.client = SimpleNamespace(
             connect=AsyncMock(), disconnect=AsyncMock(),
             send_code_request=AsyncMock(return_value=SentCode(type=SentCodeTypeApp(length=5), phone_code_hash="test-hash-1", timeout=60)),
             sign_in=AsyncMock(), get_me=AsyncMock(return_value=SimpleNamespace(id=1, first_name="Test", last_name="User", username="test")),
             session=SimpleNamespace(save=lambda: "encrypted-test-session"),
         )
-        for name, value in [("login_sessions", {}), ("phone_retry_at", {}), ("main_client", None), ("login_start_lock", asyncio.Lock()), ("client_lock", asyncio.Lock()), ("get_client", AsyncMock(return_value=None)), ("TelegramClient", lambda *args, **kwargs: self.client)]:
+        for name, value in [("login_sessions", {}), ("phone_retry_at", {}), ("login_start_lock", asyncio.Lock()), ("TelegramClient", lambda *args, **kwargs: self.client)]:
             patcher = patch.object(app, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -121,15 +171,16 @@ class PhoneLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wrong_password.exception.detail, "PasswordHashInvalidError")
         result = await app.login_password(key, app.PasswordBody(password="correct"), authorization="test")
         self.assertEqual(result["status"], "completed")
-        self.assertIs(app.main_client, self.client)
-        self.assertEqual(app.load_session(), "encrypted-test-session")
-        self.assertNotIn(b"encrypted-test-session", app.SESSION_FILE.read_bytes())
+        self.assertIs(app.clients[result["account_id"]], self.client)
+        encrypted = self.store.account(result["account_id"])["session"]
+        self.assertEqual(app.FERNET.decrypt(encrypted), b"encrypted-test-session")
+        self.assertNotIn(b"encrypted-test-session", encrypted)
 
     async def test_code_only_login(self):
         sent = await self.send()
         result = await app.login_verify_code(sent["login_id"], app.CodeBody(code="12345"), authorization="test")
         self.assertEqual(result["status"], "completed")
-        self.assertIs(app.main_client, self.client)
+        self.assertIs(app.clients[result["account_id"]], self.client)
 
     async def test_resend_reuses_session_and_updates_code_hash(self):
         sent = await self.send()
@@ -178,6 +229,110 @@ class PhoneLoginTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(app.HTTPException):
             await self.send()
         self.assertEqual(self.client.send_code_request.await_count, 1)
+
+
+class MultiSourceTests(BackendCase):
+    def test_legacy_migration_is_idempotent(self):
+        encrypted = app.FERNET.encrypt(b"legacy-test-session")
+        self.store.import_legacy(encrypted, {"channel_id": -100123, "title": "Legacy source"})
+        self.store.import_legacy(encrypted, {"channel_id": -100123})
+        accounts = self.store.accounts()
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(self.store.account(accounts[0]["id"])["session"], encrypted)
+        self.assertEqual(len(self.store.sources()), 1)
+        self.store.remove_account(accounts[0]["id"])
+        self.store.import_legacy(encrypted, {"channel_id": -100123})
+        self.assertEqual(self.store.accounts(), [], "Logged-out legacy session must not be imported again")
+
+    def test_pagination_beyond_200_and_search_across_sources(self):
+        first = self.add_source()
+        second = self.add_source(self.add_account("b" * 24, "2"))
+        items = [{"id": number, "title": "video " + str(number), "date": f"2026-01-01T00:{number // 60:02}:{number % 60:02}+00:00", "file_name": "test.mp4"} for number in range(1, 236)]
+        self.store.index_batch(first, items)
+        self.store.index_batch(second, [{"id": 1, "title": "unique song", "date": "2027-01-01T00:00:00+00:00", "file_name": "100%_song.mp3"}])
+        page = self.store.catalog(8)
+        self.assertEqual(page["page_size"], 30)
+        self.assertEqual(page["total"], 236)
+        self.assertEqual(len(page["items"]), 26)
+        self.assertFalse(page["has_next"])
+        self.assertEqual(self.store.catalog(1, query="100%_")["total"], 1)
+        self.assertEqual(self.store.catalog(1, source_id=first)["total"], 235)
+        self.assertEqual(len(self.store.catalog(1)["items"]), 30)
+        self.store.remove_account("b" * 24)
+        self.assertEqual(self.store.catalog()["total"], 235)
+
+    async def test_index_resumes_and_reads_entire_history(self):
+        source_id = self.add_source()
+        document = SimpleNamespace(mime_type="video/mp4", size=100, attributes=[DocumentAttributeFilename("test.mp4")])
+        messages = [SimpleNamespace(id=number, document=document, message="Video", date=datetime.now(timezone.utc)) for number in range(350, 0, -1)]
+        calls = []
+        interrupt = True
+
+        async def iterate(peer, limit, offset_id=0, min_id=0):
+            calls.append((offset_id, min_id))
+            if interrupt and len(calls) == 3:
+                raise asyncio.CancelledError()
+            eligible = [message for message in messages if (not offset_id or message.id < offset_id) and message.id > min_id]
+            for message in eligible[:limit]:
+                yield message
+
+        with patch.object(app, "get_client", AsyncMock(return_value=SimpleNamespace(iter_messages=iterate))):
+            with self.assertRaises(asyncio.CancelledError):
+                await app.sync_source(source_id)
+            self.assertEqual(self.store.catalog()["total"], 200)
+            self.assertEqual(self.store.source(source_id)["cursor"], 151)
+            interrupt = False
+            await app.sync_source(source_id)
+        self.assertEqual(self.store.catalog()["total"], 350)
+        self.assertTrue(self.store.source(source_id)["history_done"])
+        self.assertEqual(len(self.store.catalog(12)["items"]), 20)
+
+    async def test_background_tick_honors_and_recovers_from_flood_wait(self):
+        source_id = self.add_source()
+        self.store.source_error(source_id, "wait", time.time() + 30)
+        with patch.object(app, "sync_source", AsyncMock()) as sync:
+            app.sync_tick()
+            self.assertNotIn(source_id, app.source_jobs)
+            self.store.source_error(source_id, "wait", time.time() - 1)
+            app.sync_tick()
+            await app.source_jobs[source_id]
+            sync.assert_awaited_once_with(source_id)
+
+    async def test_dialog_search_and_basic_groups(self):
+        account = self.add_account()
+        entries = [{"id": -number, "title": "普通群 " + str(number), "username": "", "kind": "group", "peer": {"type": "chat", "id": number}} for number in range(1, 351)]
+        with patch.object(app, "get_dialog_entries", AsyncMock(return_value=entries)), patch.object(app, "schedule_sync"):
+            result = await app.dialogs(account, q="350", authorization="test")
+            self.assertEqual(result["total"], 1)
+            self.assertNotIn("peer", result["items"][0])
+            result = await app.add_sources(app.SourcesBody(account_id=account, chat_ids=[-1, -350]), authorization="test")
+            self.assertEqual(len(result["sources"]), 2)
+            self.assertTrue(all(source["kind"] == "group" for source in result["sources"]))
+
+    async def test_logout_only_removes_target_account(self):
+        first, second = self.add_account(), self.add_account("b" * 24, "2")
+        source_id = self.add_source(first)
+        self.add_source(second)
+        client = SimpleNamespace(is_connected=lambda: True, log_out=AsyncMock(return_value=True))
+        other = SimpleNamespace(is_connected=lambda: True, log_out=AsyncMock())
+        app.clients.update({first: client, second: other})
+        await app.account_logout(first, authorization="test")
+        client.log_out.assert_awaited_once()
+        other.log_out.assert_not_awaited()
+        self.assertIsNone(self.store.account(first))
+        self.assertIsNone(self.store.source(source_id))
+        self.assertIs(app.clients[second], other)
+
+    async def test_adding_account_preserves_existing_client(self):
+        first = self.add_account()
+        other = SimpleNamespace(disconnect=AsyncMock())
+        app.clients[first] = other
+        new = SimpleNamespace(get_me=AsyncMock(return_value=SimpleNamespace(id=2, first_name="Second", last_name=None, username="second")), session=SimpleNamespace(save=lambda: "new-test-session"))
+        with patch.object(app, "schedule_sync"):
+            await app.finish_login("new-login", new)
+        self.assertEqual(len(self.store.accounts()), 2)
+        self.assertIs(app.clients[first], other)
+        other.disconnect.assert_not_awaited()
 
 
 if __name__ == "__main__":

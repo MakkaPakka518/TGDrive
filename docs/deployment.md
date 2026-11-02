@@ -1,5 +1,52 @@
 # 部署 TGDrive
 
+## 一键交互式部署
+
+适用于 Debian / Ubuntu（Python 3.8+、systemd）。先将自己的后端域名通过 A / AAAA 记录解析到服务器，Cloudflare 使用「仅 DNS」，并放行 TCP 80 / 443。
+
+以 root 登录服务器后运行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/MakkaPakka518/TGDrive/main/install.sh)
+```
+
+安装脚本来自本仓库，会获取 `main` 分支源码。通过 SSH 终端运行即可；所有询问从终端读取，API hash、服务令牌和管理密码输入时隐藏。
+
+| 询问项 | 说明 |
+| --- | --- |
+| 安装目录 | 默认 `/opt/tgdrive` |
+| 已解析的后端域名 | 例如 `api.example.com`，脚本不会自行选择第三方域名 |
+| 前端地址 | 自己的 HTTPS 域名或完整 `workers.dev` 地址 |
+| 本地端口 | 默认3219，仅监听 `127.0.0.1` |
+| Telegram API ID/hash | 使用自己的开发者 API 配置 |
+| 服务令牌、管理密码 | 首次留空自动生成；升级留空保留 |
+| 证书邮箱 | 可留空 |
+
+脚本自动完成 Python 环境和依赖安装、HTTP挑战校验、Certbot证书签发、Nginx流式代理、systemd服务和证书自动续期。已有冲突端口或其他站点占用该域名时会停止并给出提示。
+
+完成后的文件：
+
+- `backend/.env`：后端配置；
+- `backend/data/`：默认的数据目录；
+- `worker/.secrets.json`、`worker/wrangler.local.jsonc`：部署 Worker 所需的私有配置；
+- `.venvs/`：各次安装的独立 Python 环境；
+- `backups/`：升级前的源码、配置及数据备份；
+- `.install.local.json`：当前安装参数。
+
+这些私有配置和数据目录都已被 Git 忽略。后端服务名为 `tgdrive.service`；证书通过 `certbot.timer` 自动续期，更新后会检查并重载 Nginx。
+
+后端部署完成后，安装 Node.js 22.17+，到安装目录的 `worker/` 下执行 `npm ci`、`npx wrangler login`、`npm run deploy` 部署前端。脚本不需要 Cloudflare DNS Token。
+
+只询问并查看计划、不修改系统：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/MakkaPakka518/TGDrive/main/install.sh) --dry-run
+```
+
+此模式需要本机已有 `git` 和 `python3`。重复正式运行安装命令时，填写相同安装目录即可升级；已经保存的密钥默认保留，防止已登录账号的加密会话失效。
+
+## 以下为手动部署步骤
+
 ## 1. 准备
 
 - 一台可连接 Telegram 的 Linux 服务器，Python 3.11，Nginx。
@@ -100,7 +147,10 @@ npm run deploy
 2. 默认选择验证码登录：输入国家码和手机号，发送验证码。
 3. 按网页提示，从 Telegram 官方聊天、短信或实际发送方式读取登录码。
 4. 回到网页输入验证码；如启用了两步验证，继续输入密码。
-5. 选择频道，点击「设为网盘频道」。
+5. 打开「管理面板」，选择账号，搜索群／频道，勾选多个结果并点击「将勾选项设为网盘」。可跨分页和搜索结果累计勾选。
+6. 到媒体库查看资源：每页30项，可按来源筛选、跨已索引资源搜索、前后翻页或输入页码跳转。
+
+管理面板可继续添加其他账号，也可退出指定账号。账号会话相互隔离；普通群、超级群、频道均可添加。
 
 验证码流程支持切换应用后返回、刷新恢复、重发倒计时及错误重试。验证码、两步验证密码仅用于当前请求，不写入配置文件；等待登录的手机号和 code hash 暂存于服务内存。
 
@@ -115,8 +165,12 @@ sudo journalctl -u tgdrive.service --since "10 minutes ago"
 
 持久化文件位于后端 `DATA_DIR`：
 
-- `telegram.session.enc`：加密的 Telegram 会话；
-- `config.json`：选中频道的配置。
+- `tgdrive.db`：SQLite 账号注册表、加密 Telegram 会话、网盘来源及媒体索引；
+- `tgdrive.db-wal`、`tgdrive.db-shm`：SQLite 运行时文件。
+
+备份数据库时先停止服务，或使用 SQLite 的在线备份 API，以保证一致性。旧版的 `telegram.session.enc` 和 `config.json` 会在首次升级时自动迁移，并保留原文件；数据库记录迁移完成状态，退出账号后不会从旧文件重新导入。
+
+同步任务按批次记录历史游标，后台读取全部可访问历史，重启会继续。首次添加大频道时，界面显示同步状态，媒体总数随索引增加。移除网盘来源仅移除本地索引，不删除 Telegram 消息。
 
 备份时同时保留后端 `.env` 中的 `SESSION_ENCRYPTION_KEY`。丢失该密钥将无法解密原会话。升级源码应保留 `.env`、本地 Worker 配置、Worker secrets 和 `data/`，然后重新安装依赖、运行测试并重启服务。
 
@@ -131,4 +185,7 @@ sudo journalctl -u tgdrive.service --since "10 minutes ago"
 | 验证码未收到 | Telegram 官方聊天、页面显示的发送方式、国家码，以及 Telegram 的频率限制 |
 | 刷新后登录会话失效 | 等待验证码的会话已超时，或后端被重启；重新开始登录 |
 | 媒体显示但无法播放 | 浏览器编码兼容性、签名有效期、后端媒体链接和 Range 响应 |
-| 无法找到旧媒体 | 当前只扫描最近200条消息 |
+| 尚未找到旧媒体 | 查看来源同步进度与错误提示；首次历史索引可能仍在进行 |
+| 历史媒体信息有变动 | 在管理面板对对应来源执行「重建索引」 |
+| 下载文件 | 点击媒体卡片「下载」或播放器「下载原文件」；由后端直接流式发送，文件名保持原名 |
+| 续传链接失效 | 下载链接默认12小时有效，过期后回网页重新点击下载 |

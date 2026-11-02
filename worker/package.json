@@ -7,7 +7,7 @@
   "engines": { "node": ">=22.17.0" },
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "test:browser": "node tests/browser.mjs",
+    "test:browser": "node tests/browser.mjs && node tests/management.mjs",
     "build": "wrangler deploy --dry-run --outdir dist",
     "deploy": "wrangler deploy --config wrangler.local.jsonc --secrets-file .secrets.json"
   },

@@ -104,7 +104,7 @@ async function backend(env, path, data) {
 }
 
 async function handle(req, env) {
-  const { pathname, origin } = new URL(req.url);
+  const { pathname, origin, searchParams } = new URL(req.url);
   const method = req.method;
   if (pathname === "/" && method === "GET") return new Response(HTML, { headers: responseHeaders("text/html; charset=utf-8", env) });
   if (pathname === "/app.js" && method === "GET") return new Response(APP_JS, { headers: responseHeaders("application/javascript; charset=utf-8", env) });
@@ -139,6 +139,11 @@ async function handle(req, env) {
   if (await cookieValue(req, env, "tgdrive") !== "admin") throw new ApiError(401, "unauthorized");
   if (pathname === "/api/me" && method === "GET") return json({ ok: true });
   if (pathname === "/api/tg/status" && method === "GET") return json(await backend(env, "/v1/status"));
+  if (pathname === "/api/tg/cancel" && method === "POST") {
+    const id = await cookieValue(req, env, "tg_login");
+    if (id) await backend(env, "/v1/login/cancel?login_id=" + encodeURIComponent(id), {});
+    return json({ ok: true }, 200, { "Set-Cookie": `tg_login=; Max-Age=0; ${COOKIE_OPTIONS}` });
+  }
   if (pathname === "/api/tg/qr" && method === "POST") {
     const previous = await cookieValue(req, env, "tg_login");
     const data = await backend(env, "/v1/login/qr" + (previous ? "?login_id=" + encodeURIComponent(previous) : ""), {});
@@ -167,15 +172,48 @@ async function handle(req, env) {
     if (typeof data.password !== "string" || !data.password) throw new ApiError(400, "请输入两步验证密码");
     return json(await backend(env, "/v1/login/password" + suffix, { password: data.password }));
   }
-  if (pathname === "/api/channels" && method === "GET") return json(await backend(env, "/v1/channels"));
-  if (pathname === "/api/channel" && method === "POST") {
+  if (pathname === "/api/accounts" && method === "GET") return json(await backend(env, "/v1/accounts"));
+  const accountAction = pathname.match(/^\/api\/accounts\/([a-f0-9]{24})\/logout$/);
+  if (accountAction && method === "POST") return json(await backend(env, "/v1/accounts/" + accountAction[1] + "/logout", {}));
+  if (pathname === "/api/sources" && method === "GET") return json(await backend(env, "/v1/sources"));
+  if (pathname === "/api/sources" && method === "POST") {
     const data = await body(req);
-    if (!Number.isSafeInteger(data.channel_id) || data.channel_id >= 0) throw new ApiError(400, "请选择有效频道");
-    return json(await backend(env, "/v1/channel", { channel_id: data.channel_id }));
+    if (typeof data.account_id !== "string" || !/^[a-f0-9]{24}$/.test(data.account_id) || !Array.isArray(data.chat_ids) || !data.chat_ids.length || data.chat_ids.length > 100 || data.chat_ids.some(id => !Number.isSafeInteger(id) || id >= 0)) throw new ApiError(400, "请选择有效账号及群组、频道");
+    return json(await backend(env, "/v1/sources", { account_id: data.account_id, chat_ids: data.chat_ids }));
   }
-  if (pathname === "/api/catalog" && method === "GET") return json(await backend(env, "/v1/catalog?limit=200"));
-  const media = pathname.match(/^\/api\/media-link\/(\d+)$/);
-  if (media && method === "GET") return json(await backend(env, "/v1/media-link/" + media[1]));
+  const sourceAction = pathname.match(/^\/api\/sources\/([a-f0-9]{24})\/(remove|sync)$/);
+  if (sourceAction && method === "POST") {
+    const data = await body(req);
+    return json(await backend(env, "/v1/sources/" + sourceAction[1] + "/" + sourceAction[2], sourceAction[2] === "sync" ? { reset: data.reset === true } : {}));
+  }
+  if (["/api/dialogs", "/api/catalog"].includes(pathname) && method === "GET") {
+    const page = Number(searchParams.get("page") || 1);
+    if (!Number.isSafeInteger(page) || page < 1 || page > 1000000) throw new ApiError(400, "页码无效");
+    const params = new URLSearchParams({ page: String(page), q: (searchParams.get("q") || "").slice(0, 200) });
+    if (searchParams.get("refresh") === "true") params.set("refresh", "true");
+    if (pathname === "/api/dialogs") {
+      const account = searchParams.get("account_id") || "";
+      if (!/^[a-f0-9]{24}$/.test(account)) throw new ApiError(400, "请选择Telegram账号");
+      params.set("account_id", account);
+      const kind = searchParams.get("kind") || "all";
+      params.set("kind", ["all", "channel", "group"].includes(kind) ? kind : "all");
+    } else if (searchParams.get("source_id")) {
+      const id = searchParams.get("source_id");
+      if (!/^[a-f0-9]{24}$/.test(id)) throw new ApiError(400, "网盘来源无效");
+      params.set("source_id", id);
+    }
+    return json(await backend(env, pathname.replace("/api/", "/v1/") + "?" + params));
+  }
+  const media = pathname.match(/^\/api\/media-link\/([a-f0-9]{24})\/(\d+)$/);
+  if (media && method === "GET") return json(await backend(env, "/v1/media-link/" + media[1] + "/" + media[2]));
+  const download = pathname.match(/^\/api\/download\/([a-f0-9]{24})\/(\d+)$/);
+  if (download && ["GET", "HEAD"].includes(method)) {
+    const data = await backend(env, "/v1/download-link/" + download[1] + "/" + download[2]);
+    const target = new URL(data.download_url);
+    const base = new URL(env.BACKEND_URL);
+    if (target.origin !== base.origin || !target.pathname.startsWith(base.pathname.replace(/\/$/, "") + "/v1/download/")) throw new ApiError(502, "下载链接无效");
+    return new Response(null, { status: 302, headers: { ...responseHeaders("text/plain; charset=utf-8"), Location: target.href } });
+  }
   return json({ error: "not_found" }, 404);
 }
 

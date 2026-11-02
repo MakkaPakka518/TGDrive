@@ -15,14 +15,14 @@ try {
     let method = "phone";
     let sentCount = 0;
     let needsPassword = true;
-    const state = () => ({ status: phase, method, phone_masked: "+15****0100", delivery: "telegram", retry_after: 1 });
+    const state = () => ({ status: phase, method, account_id: "a".repeat(24), phone_masked: "+15****0100", delivery: "telegram", retry_after: 1 });
     await context.route(base + "/**", async route => {
       const path = new URL(route.request().url()).pathname;
       if (path === "/") return route.fulfill({ contentType: "text/html", body: HTML });
       if (path === "/app.js") return route.fulfill({ contentType: "application/javascript", body: APP_JS });
       let status = 200;
       let data = { ok: true };
-      if (path === "/api/tg/status") data = { authorized: phase === "completed", user: { name: "测试账号" } };
+      if (path === "/api/tg/status") data = { accounts: phase === "completed" ? [{ id: "a".repeat(24), name: "测试账号", source_count: 0, status: "ready" }] : [], sources: [] };
       else if (path === "/api/tg/login-status") {
         if (!phase) { status = 404; data = { error: "login_expired" }; }
         else data = state();
@@ -46,7 +46,8 @@ try {
         method = "qr";
         phase = "password_required";
         data = { qr: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jQioAAAAASUVORK5CYII=", expires_in: 30 };
-      } else if (path === "/api/channels") data = { channels: [] };
+      } else if (path === "/api/dialogs") data = { items: [], page: 1, pages: 1, total: 0 };
+      else if (path === "/api/catalog") data = { items: [], page: 1, pages: 1, page_size: 30, total: 0, sources: [], syncing: false };
       await route.fulfill({ status, contentType: "application/json", body: JSON.stringify(data) });
     });
     await page.goto(base);

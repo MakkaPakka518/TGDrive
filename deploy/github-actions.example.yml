@@ -19,6 +19,8 @@ jobs:
       - run: pip install -r backend/requirements.txt
       - run: python backend/test_app.py
       - run: python scripts/test_configure.py
+      - run: python scripts/test_installer.py
+      - run: bash -n install.sh
       - run: python scripts/check-public-files.py
   worker:
     runs-on: ubuntu-latest

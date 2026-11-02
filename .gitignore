@@ -24,6 +24,8 @@ data/
 
 # Local tooling, deployment snapshots and generated files
 .venv/
+.venvs/
+backups/
 venv/
 __pycache__/
 *.py[cod]

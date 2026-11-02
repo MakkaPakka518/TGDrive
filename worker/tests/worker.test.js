@@ -23,9 +23,9 @@ test("authentication, signed login session, errors, and backend proxy contract",
   assert.equal((await worker.fetch(request("/api/me", { headers: { Cookie: admin } }), env)).status, 200);
   assert.equal((await worker.fetch(request("/api/me", { headers: { Cookie: admin + "x" } }), env)).status, 401);
   assert.equal((await worker.fetch(post("/api/tg/qr", {}, { Cookie: admin, Origin: "https://attacker.example" }), env)).status, 403);
-  assert.equal((await worker.fetch(post("/api/channel", { channel_id: "bad" }, { Cookie: admin }), env)).status, 400);
+  assert.equal((await worker.fetch(post("/api/sources", { account_id: "bad", chat_ids: [] }, { Cookie: admin }), env)).status, 400);
   assert.equal((await worker.fetch(request("/api/tg/login-status", { headers: { Cookie: admin } }), env)).status, 404);
-  assert.equal((await worker.fetch(request("/api/channel", { method: "POST", headers: { Cookie: admin }, body: "{" }), env)).status, 400);
+  assert.equal((await worker.fetch(request("/api/sources", { method: "POST", headers: { Cookie: admin }, body: "{" }), env)).status, 400);
   const original = globalThis.fetch;
   const calls = [];
   try {
@@ -44,10 +44,10 @@ test("authentication, signed login session, errors, and backend proxy contract",
     assert.equal((await worker.fetch(post("/api/tg/password", { password: "2fa" }, { Cookie: cookies }), env)).status, 200);
     assert.equal(calls.at(-1).url, env.BACKEND_URL + "/v1/login/password?login_id=opaque-login-id");
     assert.deepEqual(JSON.parse(calls.at(-1).options.body), { password: "2fa" });
-    assert.equal((await worker.fetch(post("/api/channel", { channel_id: -1001234567890 }, { Cookie: admin }), env)).status, 200);
-    assert.deepEqual(JSON.parse(calls.at(-1).options.body), { channel_id: -1001234567890 });
+    assert.equal((await worker.fetch(post("/api/sources", { account_id: "a".repeat(24), chat_ids: [-1001234567890, -123] }, { Cookie: admin }), env)).status, 200);
+    assert.deepEqual(JSON.parse(calls.at(-1).options.body), { account_id: "a".repeat(24), chat_ids: [-1001234567890, -123] });
     globalThis.fetch = async () => Response.json({ detail: "telegram_login_required" }, { status: 401 });
-    const unauthorized = await worker.fetch(request("/api/channels", { headers: { Cookie: admin } }), env);
+    const unauthorized = await worker.fetch(request("/api/dialogs?account_id=" + "a".repeat(24), { headers: { Cookie: admin } }), env);
     assert.equal(unauthorized.status, 401);
     assert.deepEqual(await unauthorized.json(), { error: "telegram_login_required" });
     globalThis.fetch = async () => { throw new Error("private upstream details"); };
@@ -58,6 +58,33 @@ test("authentication, signed login session, errors, and backend proxy contract",
   const logout = await worker.fetch(post("/api/logout", {}, { Cookie: admin }), env);
   assert.equal(logout.headers.getSetCookie().length, 2);
   for (const value of logout.headers.getSetCookie()) assert.match(value, /Max-Age=0/);
+});
+
+test("catalog pagination, dialog search and scoped account/source operations", async () => {
+  const login = await worker.fetch(post("/api/login", { password: env.ADMIN_PASSWORD }), env);
+  const headers = { Cookie: login.headers.get("Set-Cookie").split(";")[0] };
+  const original = globalThis.fetch;
+  const calls = [];
+  try {
+    globalThis.fetch = async (url, options) => { calls.push({ url, options }); return Response.json({ ok: true }); };
+    await worker.fetch(request("/api/catalog?page=9&q=music&source_id=" + "c".repeat(24), { headers }), env);
+    const catalog = new URL(calls.at(-1).url);
+    assert.equal(catalog.searchParams.get("page"), "9");
+    assert.equal(catalog.searchParams.get("q"), "music");
+    assert.equal(catalog.searchParams.get("source_id"), "c".repeat(24));
+    assert.equal(catalog.searchParams.has("limit"), false);
+    assert.equal((await worker.fetch(request("/api/catalog?page=-1", { headers }), env)).status, 400);
+    assert.equal((await worker.fetch(request("/api/dialogs", { headers }), env)).status, 400);
+    await worker.fetch(request("/api/dialogs?account_id=" + "a".repeat(24) + "&q=%40group&kind=group&page=2", { headers }), env);
+    const dialogs = new URL(calls.at(-1).url);
+    assert.equal(dialogs.searchParams.get("q"), "@group");
+    assert.equal(dialogs.searchParams.get("kind"), "group");
+    await worker.fetch(post("/api/accounts/" + "b".repeat(24) + "/logout", {}, headers), env);
+    assert.equal(new URL(calls.at(-1).url).pathname, "/api/v1/accounts/" + "b".repeat(24) + "/logout");
+    assert.equal((await worker.fetch(post("/api/accounts/" + "b".repeat(24) + "/logout", {}, { ...headers, Origin: "https://attacker.example" }), env)).status, 403);
+    await worker.fetch(request("/api/media-link/" + "c".repeat(24) + "/123", { headers }), env);
+    assert.equal(new URL(calls.at(-1).url).pathname, "/api/v1/media-link/" + "c".repeat(24) + "/123");
+  } finally { globalThis.fetch = original; }
 });
 
 test("phone code sessions, resends, two-factor forwarding and flood feedback", async () => {
@@ -96,5 +123,25 @@ test("phone code sessions, resends, two-factor forwarding and flood feedback", a
     assert.equal(flood.status, 429);
     assert.equal(flood.headers.get("Retry-After"), "120");
     assert.equal((await flood.json()).retry_after, 120);
+  } finally { globalThis.fetch = original; }
+});
+
+test("downloads require management authentication and redirect only to configured backend", async () => {
+  const path = "/api/download/" + "a".repeat(24) + "/42";
+  assert.equal((await worker.fetch(request(path), env)).status, 401);
+  const login = await worker.fetch(post("/api/login", { password: env.ADMIN_PASSWORD }), env);
+  const headers = { Cookie: login.headers.get("Set-Cookie").split(";")[0] };
+  const original = globalThis.fetch;
+  try {
+    const url = env.BACKEND_URL + "/v1/download/" + "a".repeat(24) + "/42?exp=123&sig=test";
+    globalThis.fetch = async target => {
+      assert.equal(target, env.BACKEND_URL + "/v1/download-link/" + "a".repeat(24) + "/42");
+      return Response.json({ download_url: url });
+    };
+    const response = await worker.fetch(request(path, { headers }), env);
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("Location"), url);
+    globalThis.fetch = async () => Response.json({ download_url: "https://other.example/download" });
+    assert.equal((await worker.fetch(request(path, { headers }), env)).status, 502);
   } finally { globalThis.fetch = original; }
 });
