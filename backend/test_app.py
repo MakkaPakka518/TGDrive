@@ -91,7 +91,56 @@ class DriveTests(BackendCase):
                 actual = b"" if method == "HEAD" else b"".join([chunk async for chunk in response.body_iterator])
                 self.assertEqual(actual, expected)
                 self.assertEqual(int(response.headers["content-length"]), 10 if method == "HEAD" else len(expected))
-            self.assertEqual(offsets, [123, len(payload) - 10, 0])
+            self.assertEqual(offsets, [0, (len(payload) - 10) // (512 * 1024) * (512 * 1024), 0])
+
+    async def test_real_telethon_iterator_obeys_getfile_boundaries_for_safari_ranges(self):
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from telethon.tl.types import InputDocumentFileLocation
+        from telethon.errors import LimitInvalidError
+
+        source_id = self.add_source()
+        payload = bytes(range(256)) * 16000
+        message = SimpleNamespace(id=42, document=SimpleNamespace(mime_type="audio/mpeg", size=len(payload), attributes=[DocumentAttributeFilename("test.mp3")]), media=InputDocumentFileLocation(id=1, access_hash=0, file_reference=b"test", thumb_size=""), message="", date=None)
+        client = TelegramClient(StringSession(), 123, "test")
+        offsets = []
+
+        async def get_file(sender, request):
+            start, length = request.offset, request.limit
+            if start % 4096 or length % 4096 or start // (1024 * 1024) != (start + length - 1) // (1024 * 1024):
+                raise LimitInvalidError(None)
+            offsets.append(start)
+            return SimpleNamespace(bytes=payload[start:start + length])
+
+        client._call = AsyncMock(side_effect=get_file)
+        with patch.object(app, "get_message", AsyncMock(return_value=(client, message))):
+            expires, signature = app.sign_media(source_id, 42, "music")
+            for start, end in [(57344, 1500000), (65536, 2000000), (1044480, 1060000), (len(payload) - 8192, len(payload) - 1)]:
+                request = Request({"type": "http", "method": "GET", "headers": [(b"range", f"bytes={start}-{end}".encode())]})
+                response = await app.music_media(source_id, 42, request, expires, signature)
+                actual = b"".join([chunk async for chunk in response.body_iterator])
+                self.assertEqual(actual, payload[start:end + 1])
+                self.assertEqual(response.headers["Content-Length"], str(len(actual)))
+        self.assertTrue(all(offset % (512 * 1024) == 0 for offset in offsets))
+
+    async def test_short_telegram_stream_is_an_error_and_iterator_is_closed(self):
+        source_id = self.add_source()
+        message = SimpleNamespace(id=42, document=SimpleNamespace(mime_type="audio/mpeg", size=1000, attributes=[]), media=object(), message="", date=None)
+        closed = []
+
+        async def short_stream(*args, **kwargs):
+            try:
+                yield b"x" * 100
+            finally:
+                closed.append(True)
+
+        request = Request({"type": "http", "method": "GET", "headers": []})
+        with patch.object(app, "get_message", AsyncMock(return_value=(SimpleNamespace(iter_download=short_stream), message))):
+            expires, signature = app.sign_media(source_id, 42, "music")
+            response = await app.music_media(source_id, 42, request, expires, signature)
+            with self.assertRaises(IOError):
+                _ = [chunk async for chunk in response.body_iterator]
+        self.assertEqual(closed, [True])
 
     async def test_completed_login_cleanup_keeps_active_client(self):
         client = SimpleNamespace(disconnect=AsyncMock())

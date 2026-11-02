@@ -9,12 +9,14 @@ import os
 import re
 import secrets
 import time
+from contextlib import suppress
 from datetime import timezone
 from pathlib import Path
 from typing import List
 from urllib.parse import quote
 
 import qrcode
+import anyio
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -936,15 +938,39 @@ async def serve_media(source_id, message_id, request, exp, sig, attachment=False
 
     async def body():
         remaining = length
+        # Telegram GetFile requests must stay inside a 1 MiB window. Telethon's
+        # direct iterator accepts 4 KiB-aligned offsets that can still cross that
+        # window with a 512 KiB request (e.g. Safari resumes at byte 57344).
+        # Fetch on 512 KiB boundaries, then trim to the exact HTTP byte range.
+        request_size = 512 * 1024
+        aligned_start = start - start % request_size
+        skip = start - aligned_start
         async with download_slots:
-            async for chunk in client.iter_download(message.media, offset=start, request_size=512 * 1024):
-                if not chunk or remaining <= 0:
-                    break
-                part = chunk[:remaining]
-                remaining -= len(part)
-                yield part
-                if remaining <= 0:
-                    break
+            iterator = client.iter_download(message.media, offset=aligned_start, request_size=request_size)
+            try:
+                async for chunk in iterator:
+                    if not chunk:
+                        break
+                    if skip:
+                        discarded = min(skip, len(chunk))
+                        chunk = chunk[discarded:]
+                        skip -= discarded
+                    if not chunk:
+                        continue
+                    part = chunk[:remaining]
+                    remaining -= len(part)
+                    yield part
+                    if remaining == 0:
+                        break
+                if remaining:
+                    raise IOError("Telegram stream ended before the requested byte range was complete")
+            finally:
+                close = getattr(iterator, "close", None) or getattr(iterator, "aclose", None)
+                if close:
+                    # Release borrowed Telegram senders even if the browser cancels
+                    # a range probe. An interrupted iterator may not be initialized.
+                    with anyio.CancelScope(shield=True), suppress(AttributeError):
+                        await close()
 
     return StreamingResponse(body(), status_code=206 if partial else 200, media_type=media_type, headers=headers)
 
