@@ -16,13 +16,13 @@ try {
   let submitted = [];
   let loggedOut = "";
   const allDialogs = Array.from({ length: 65 }, (_, index) => ({ id: -index - 1, title: index === 64 ? "目标群" : "普通群 " + (index + 1), username: "", kind: "group" }));
-  const allMedia = Array.from({ length: 235 }, (_, index) => ({ id: index + 1, source_id: "c".repeat(24), source_title: "Initial source", title: index === 220 ? "needle video" : "Video " + (index + 1), kind: "video", duration: 30, size: 1024 }));
+  const allMedia = Array.from({ length: 235 }, (_, index) => ({ id: index + 1, source_id: "c".repeat(24), source_title: "Initial source", title: index === 220 ? "needle video" : "Video " + (index + 1), kind: "video", duration: 30, size: 1024, download_url: base + "/signed-download/" + (index + 1) + "?exp=123&sig=test" }));
   const sourceList = () => sources.map(source => ({ ...source, account_name: accounts.find(account => account.id === source.account_id)?.name, syncing: false, error: "" }));
   await context.route(base + "/**", async route => {
     const url = new URL(route.request().url());
     if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: HTML });
     if (url.pathname === "/app.js") return route.fulfill({ contentType: "application/javascript", body: APP_JS });
-    if (url.pathname.startsWith("/api/download/")) return route.fulfill({ contentType: "application/octet-stream", headers: { "Content-Disposition": "attachment; filename*=UTF-8''" + encodeURIComponent("测试视频.mp4") }, body: "fake-media-file" });
+    if (url.pathname.startsWith("/signed-download/")) return route.fulfill({ contentType: "application/octet-stream", headers: { "Content-Disposition": "attachment; filename*=UTF-8''" + encodeURIComponent("测试视频.mp4") }, body: "fake-media-file" });
     let data = { ok: true }, status = 200;
     if (url.pathname === "/api/tg/status") data = { accounts: accounts.map(account => ({ ...account, source_count: sources.filter(source => source.account_id === account.id).length })), sources: sourceList() };
     else if (url.pathname === "/api/tg/login-status") { status = 404; data = { error: "login_expired" }; }
@@ -49,6 +49,7 @@ try {
   await page.goto(base);
   await page.waitForFunction(() => document.querySelectorAll(".item").length === 30);
   assert.match(await page.locator("#pageLabel").textContent(), /235项.*30条/);
+  assert.match(await page.locator(".downloadLink").first().getAttribute("href"), /\/signed-download\/1\?exp=123&sig=test$/);
   const downloadPromise = page.waitForEvent("download");
   await page.locator(".downloadLink").first().click();
   const downloaded = await downloadPromise;

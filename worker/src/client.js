@@ -289,7 +289,7 @@ export const APP_JS = String.raw`(() => {
       $("grid").appendChild(card);
     });
   }
-  function downloadPath(item) { return "/api/download/" + item.source_id + "/" + item.id; }
+  function downloadPath(item) { return item.download_url || "/api/download/" + item.source_id + "/" + item.id; }
   function closePlayer() {
     playback++;
     for (const id of ["video", "audio"]) {

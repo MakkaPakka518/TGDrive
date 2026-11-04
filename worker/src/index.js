@@ -69,6 +69,19 @@ async function cookieValue(req, env, name) {
   return safeEqual(await sign(env.SESSION_SECRET, `${parts[0]}.${parts[1]}`), parts[2]) ? parts[0] : "";
 }
 
+async function signedDownloadPath(env, sourceId, messageId) {
+  const expires = Date.now() + 43200000;
+  const signature = await sign(env.SESSION_SECRET, `download.${sourceId}.${messageId}.${expires}`);
+  return `/api/download/${sourceId}/${messageId}?exp=${expires}&sig=${signature}`;
+}
+
+async function validDownloadTicket(env, sourceId, messageId, searchParams) {
+  const expires = Number(searchParams.get("exp"));
+  const signature = searchParams.get("sig") || "";
+  if (!Number.isSafeInteger(expires) || expires <= Date.now() || expires > Date.now() + 43260000) return false;
+  return safeEqual(await sign(env.SESSION_SECRET, `download.${sourceId}.${messageId}.${expires}`), signature);
+}
+
 async function body(req) {
   if (Number(req.headers.get("Content-Length")) > 4096) throw new ApiError(413, "请求内容过长");
   const text = await req.text();
@@ -136,6 +149,14 @@ async function handle(req, env) {
     for (const name of ["tgdrive", "tg_login"]) response.headers.append("Set-Cookie", `${name}=; Max-Age=0; ${COOKIE_OPTIONS}`);
     return response;
   }
+  const download = pathname.match(/^\/api\/download\/([a-f0-9]{24})\/(\d+)$/);
+  if (download && ["GET", "HEAD"].includes(method) && await validDownloadTicket(env, download[1], download[2], searchParams)) {
+    const data = await backend(env, "/v1/download-link/" + download[1] + "/" + download[2]);
+    const target = new URL(data.download_url);
+    const base = new URL(env.BACKEND_URL);
+    if (target.origin !== base.origin || !target.pathname.startsWith(base.pathname.replace(/\/$/, "") + "/v1/download/")) throw new ApiError(502, "下载链接无效");
+    return new Response(null, { status: 302, headers: { ...responseHeaders("text/plain; charset=utf-8"), Location: target.href } });
+  }
   if (await cookieValue(req, env, "tgdrive") !== "admin") throw new ApiError(401, "unauthorized");
   if (pathname === "/api/me" && method === "GET") return json({ ok: true });
   if (pathname === "/api/tg/status" && method === "GET") return json(await backend(env, "/v1/status"));
@@ -202,11 +223,16 @@ async function handle(req, env) {
       if (!/^[a-f0-9]{24}$/.test(id)) throw new ApiError(400, "网盘来源无效");
       params.set("source_id", id);
     }
-    return json(await backend(env, pathname.replace("/api/", "/v1/") + "?" + params));
+    const result = await backend(env, pathname.replace("/api/", "/v1/") + "?" + params);
+    if (pathname === "/api/catalog" && Array.isArray(result.items)) {
+      for (const item of result.items) {
+        if (/^[a-f0-9]{24}$/.test(item?.source_id || "") && Number.isSafeInteger(item?.id) && item.id >= 0) item.download_url = await signedDownloadPath(env, item.source_id, item.id);
+      }
+    }
+    return json(result);
   }
   const media = pathname.match(/^\/api\/media-link\/([a-f0-9]{24})\/(\d+)$/);
   if (media && method === "GET") return json(await backend(env, "/v1/media-link/" + media[1] + "/" + media[2]));
-  const download = pathname.match(/^\/api\/download\/([a-f0-9]{24})\/(\d+)$/);
   if (download && ["GET", "HEAD"].includes(method)) {
     const data = await backend(env, "/v1/download-link/" + download[1] + "/" + download[2]);
     const target = new URL(data.download_url);

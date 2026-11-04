@@ -141,6 +141,20 @@ test("downloads require management authentication and redirect only to configure
     const response = await worker.fetch(request(path, { headers }), env);
     assert.equal(response.status, 302);
     assert.equal(response.headers.get("Location"), url);
+    globalThis.fetch = async target => {
+      if (String(target).includes("/v1/catalog?")) return Response.json({ items: [{ source_id: "a".repeat(24), id: 42 }] });
+      assert.equal(target, env.BACKEND_URL + "/v1/download-link/" + "a".repeat(24) + "/42");
+      return Response.json({ download_url: url });
+    };
+    const catalog = await worker.fetch(request("/api/catalog", { headers }), env);
+    const signedPath = (await catalog.json()).items[0].download_url;
+    assert.match(signedPath, new RegExp("^/api/download/" + "a".repeat(24) + "/42\\?exp=\\d+&sig=[A-Za-z0-9_-]+$"));
+    const copied = await worker.fetch(request(signedPath), env);
+    assert.equal(copied.status, 302);
+    assert.equal(copied.headers.get("Location"), url);
+    const tampered = new URL("https://drive.example.test" + signedPath);
+    tampered.searchParams.set("sig", "invalid");
+    assert.equal((await worker.fetch(new Request(tampered), env)).status, 401);
     globalThis.fetch = async () => Response.json({ download_url: "https://other.example/download" });
     assert.equal((await worker.fetch(request(path, { headers }), env)).status, 502);
   } finally { globalThis.fetch = original; }
